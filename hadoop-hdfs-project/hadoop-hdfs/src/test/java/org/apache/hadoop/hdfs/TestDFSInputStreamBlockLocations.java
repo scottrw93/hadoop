@@ -212,7 +212,7 @@ public class TestDFSInputStreamBlockLocations {
       boolean firstIteration = true;
       if (this.enableBlkExpiration) {
         // set the time stamps to make sure that we do not refresh locations yet
-        fin.setReadTimeStampsForTesting(Time.monotonicNow());
+        fin.setLastRefreshedBlocksAtForTesting(Time.monotonicNow());
       }
       while (fin.getPos() < secondBlockMark) {
         bytesRead = fin.read(readBuffer);
@@ -260,11 +260,16 @@ public class TestDFSInputStreamBlockLocations {
           assertEquals(prevDNInfo, currDNInfo);
           firstIteration = false;
           if (this.enableBlkExpiration) {
+            // should not be tracked until next iteration
+            assertFalse(dfsClient.getLocatedBlockRefresher().isInputStreamTracked(fin));
             // reset the time stamps of located blocks to force cache expiration
-            fin.setReadTimeStampsForTesting(
+            fin.setLastRefreshedBlocksAtForTesting(
                 Time.monotonicNow() - (dfsInputLocationsTimeout + 1));
           }
         }
+      }
+      if (this.enableBlkExpiration) {
+        assertTrue(dfsClient.getLocatedBlockRefresher().isInputStreamTracked(fin));
       }
       assertEquals("InputStream exceeds expected position",
           thirdBlockMark, fin.getPos());
@@ -273,7 +278,15 @@ public class TestDFSInputStreamBlockLocations {
         fout.close();
       }
       if (fin != null) {
+        // should be tracked pre-close because we triggered it above.
+        if (this.enableBlkExpiration) {
+          assertTrue(dfsClient.getLocatedBlockRefresher().isInputStreamTracked(fin));
+        }
         fin.close();
+        // should be removed after close.
+        if (this.enableBlkExpiration) {
+          assertFalse(dfsClient.getLocatedBlockRefresher().isInputStreamTracked(fin));
+        }
       }
     }
   }

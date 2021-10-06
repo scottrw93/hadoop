@@ -143,14 +143,6 @@ public class DFSStripedInputStream extends DFSInputStream {
     return curStripeBuf;
   }
 
-  protected String getSrc() {
-    return src;
-  }
-
-  protected LocatedBlocks getLocatedBlocks() {
-    return locatedBlocks;
-  }
-
   protected ByteBufferPool getBufferPool() {
     return BUFFER_POOL;
   }
@@ -393,6 +385,8 @@ public class DFSStripedInputStream extends DFSInputStream {
     if (closed.get()) {
       throw new IOException("Stream closed");
     }
+
+    maybeRegisterBlockRefresh();
 
     int len = strategy.getTargetLength();
     CorruptedBlocks corruptedBlocks = new CorruptedBlocks();
