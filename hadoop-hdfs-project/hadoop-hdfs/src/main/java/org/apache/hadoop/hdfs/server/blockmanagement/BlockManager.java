@@ -196,6 +196,7 @@ public class BlockManager implements BlockStatsMXBean {
   private boolean initializedReplQueues;
 
   private final long startupDelayBlockDeletionInMs;
+  private final long blockReplaceGracePeriodInMs;
   private final BlockReportLeaseManager blockReportLeaseManager;
   private ObjectName mxBeanName;
 
@@ -481,6 +482,9 @@ public class BlockManager implements BlockStatsMXBean {
     startupDelayBlockDeletionInMs = conf.getLong(
         DFSConfigKeys.DFS_NAMENODE_STARTUP_DELAY_BLOCK_DELETION_SEC_KEY,
         DFSConfigKeys.DFS_NAMENODE_STARTUP_DELAY_BLOCK_DELETION_SEC_DEFAULT) * 1000L;
+    blockReplaceGracePeriodInMs = conf.getLong(
+        DFSConfigKeys.DFS_NAMENODE_BLOCK_REPLACE_GRACE_PERIOD_MS_KEY,
+        DFSConfigKeys.DFS_NAMENODE_BLOCK_REPLACE_GRACE_PERIOD_MS_DEFAULT);
     invalidateBlocks = new InvalidateBlocks(
         datanodeManager.getBlockInvalidateLimit(),
         startupDelayBlockDeletionInMs,
@@ -1723,11 +1727,11 @@ public class BlockManager implements BlockStatsMXBean {
    * Adds block to list of blocks which will be invalidated on specified
    * datanode and log the operation
    */
-  void addToInvalidates(final Block block, final DatanodeInfo datanode) {
+  void addToInvalidates(final Block block, final DatanodeInfo datanode, final long gracePeriodMs) {
     if (!isPopulatingReplQueues()) {
       return;
     }
-    invalidateBlocks.add(block, datanode, true);
+    invalidateBlocks.addWithGracePeriod(block, datanode, gracePeriodMs,true);
   }
 
   /**
@@ -1823,7 +1827,7 @@ public class BlockManager implements BlockStatsMXBean {
     if (b.getStored().isDeleted()) {
       blockLog.debug("BLOCK markBlockAsCorrupt: {} cannot be marked as" +
           " corrupt as it does not belong to any file", b);
-      addToInvalidates(b.getCorrupted(), node);
+      addToInvalidates(b.getCorrupted(), node, 0);
       return;
     }
     short expectedRedundancies =
@@ -1906,7 +1910,7 @@ public class BlockManager implements BlockStatsMXBean {
     } else {
       // we already checked the number of replicas in the caller of this
       // function and know there are enough live replicas, so we can delete it.
-      addToInvalidates(b.getCorrupted(), dn);
+      addToInvalidates(b.getCorrupted(), dn, 0);
       removeStoredBlock(b.getStored(), node);
       blockLog.debug("BLOCK* invalidateBlocks: {} on {} listed for deletion.",
           b, dn);
@@ -2943,7 +2947,7 @@ public class BlockManager implements BlockStatsMXBean {
           "reported.", strBlockReportId, maxNumBlocksToLog, numBlocksLogged);
     }
     for (Block b : toInvalidate) {
-      addToInvalidates(b, node);
+      addToInvalidates(b, node, 0);
     }
     for (BlockToMarkCorrupt b : toCorrupt) {
       markBlockAsCorrupt(b, storageInfo, node);
@@ -3462,7 +3466,7 @@ public class BlockManager implements BlockStatsMXBean {
   private Block addStoredBlock(final BlockInfo block,
                                final Block reportedBlock,
                                DatanodeStorageInfo storageInfo,
-                               DatanodeDescriptor delNodeHint,
+                               ReplicaDeleteHint delNodeHint,
                                boolean logEveryBlock)
   throws IOException {
     assert block != null && namesystem.hasWriteLock();
@@ -3878,11 +3882,14 @@ public class BlockManager implements BlockStatsMXBean {
    */
   private void processExtraRedundancyBlock(final BlockInfo block,
       final short replication, final DatanodeDescriptor addedNode,
-      DatanodeDescriptor delNodeHint) {
+      ReplicaDeleteHint delNodeHint) {
     assert namesystem.hasWriteLock();
-    if (addedNode == delNodeHint) {
-      delNodeHint = null;
+    if (delNodeHint == null) {
+      delNodeHint = ReplicaDeleteHint.NONE;
+    } else if (addedNode == delNodeHint.getDatanode()) {
+      delNodeHint = delNodeHint.withNullDataNode();
     }
+
     Collection<DatanodeStorageInfo> nonExcess = new ArrayList<>();
     Collection<DatanodeDescriptor> corruptNodes = corruptReplicas
         .getNodes(block);
@@ -3915,7 +3922,7 @@ public class BlockManager implements BlockStatsMXBean {
       final Collection<DatanodeStorageInfo> nonExcess,
       BlockInfo storedBlock, short replication,
       DatanodeDescriptor addedNode,
-      DatanodeDescriptor delNodeHint) {
+      ReplicaDeleteHint delNodeHint) {
     assert namesystem.hasWriteLock();
     // first form a rack to datanodes map and
     BlockCollection bc = getBlockCollection(storedBlock);
@@ -3948,13 +3955,14 @@ public class BlockManager implements BlockStatsMXBean {
   private void chooseExcessRedundancyContiguous(
       final Collection<DatanodeStorageInfo> nonExcess, BlockInfo storedBlock,
       short replication, DatanodeDescriptor addedNode,
-      DatanodeDescriptor delNodeHint, List<StorageType> excessTypes) {
+      ReplicaDeleteHint delNodeHint, List<StorageType> excessTypes) {
+
     BlockPlacementPolicy replicator = placementPolicies.getPolicy(CONTIGUOUS);
     List<DatanodeStorageInfo> replicasToDelete = replicator
         .chooseReplicasToDelete(nonExcess, nonExcess, replication, excessTypes,
-            addedNode, delNodeHint);
+            addedNode, delNodeHint.getDatanode());
     for (DatanodeStorageInfo chosenReplica : replicasToDelete) {
-      processChosenExcessRedundancy(nonExcess, chosenReplica, storedBlock);
+      processChosenExcessRedundancy(nonExcess, chosenReplica, delNodeHint.getGracePeriod(), storedBlock);
     }
   }
 
@@ -3970,7 +3978,7 @@ public class BlockManager implements BlockStatsMXBean {
   private void chooseExcessRedundancyStriped(BlockCollection bc,
       final Collection<DatanodeStorageInfo> nonExcess,
       BlockInfo storedBlock,
-      DatanodeDescriptor delNodeHint) {
+      ReplicaDeleteHint delNodeHint) {
     assert storedBlock instanceof BlockInfoStriped;
     BlockInfoStriped sblk = (BlockInfoStriped) storedBlock;
     short groupSize = sblk.getTotalBlockNum();
@@ -3989,13 +3997,13 @@ public class BlockManager implements BlockStatsMXBean {
       storage2index.put(storage, index);
     }
 
-    // use delHint only if delHint is duplicated
+    // use delNodeHint only if delNodeHint is duplicated
     final DatanodeStorageInfo delStorageHint =
-        DatanodeStorageInfo.getDatanodeStorageInfo(nonExcess, delNodeHint);
+        DatanodeStorageInfo.getDatanodeStorageInfo(nonExcess, delNodeHint.getDatanode());
     if (delStorageHint != null) {
       Integer index = storage2index.get(delStorageHint);
       if (index != null && duplicated.get(index)) {
-        processChosenExcessRedundancy(nonExcess, delStorageHint, storedBlock);
+        processChosenExcessRedundancy(nonExcess, delStorageHint, delNodeHint.getGracePeriod(), storedBlock);
       }
     }
 
@@ -4027,7 +4035,7 @@ public class BlockManager implements BlockStatsMXBean {
             .chooseReplicasToDelete(nonExcess, candidates, (short) 1,
                 excessTypes, null, null);
         for (DatanodeStorageInfo chosen : replicasToDelete) {
-          processChosenExcessRedundancy(nonExcess, chosen, storedBlock);
+          processChosenExcessRedundancy(nonExcess, chosen, delNodeHint.getGracePeriod(), storedBlock);
           candidates.remove(chosen);
         }
       }
@@ -4037,7 +4045,8 @@ public class BlockManager implements BlockStatsMXBean {
 
   private void processChosenExcessRedundancy(
       final Collection<DatanodeStorageInfo> nonExcess,
-      final DatanodeStorageInfo chosen, BlockInfo storedBlock) {
+      final DatanodeStorageInfo chosen,
+      long gracePeriodMs, BlockInfo storedBlock) {
     nonExcess.remove(chosen);
     excessRedundancyMap.add(chosen.getDatanodeDescriptor(), storedBlock);
     //
@@ -4050,9 +4059,10 @@ public class BlockManager implements BlockStatsMXBean {
     // upon giving instructions to the datanodes.
     //
     final Block blockToInvalidate = getBlockOnStorage(storedBlock, chosen);
-    addToInvalidates(blockToInvalidate, chosen.getDatanodeDescriptor());
+    addToInvalidates(blockToInvalidate, chosen.getDatanodeDescriptor(), gracePeriodMs);
     blockLog.debug("BLOCK* chooseExcessRedundancies: "
-        + "({}, {}) is added to invalidated blocks set", chosen, storedBlock);
+        + "({}, {}) is added to invalidated blocks set with grace period {}", chosen, storedBlock,
+        gracePeriodMs);
   }
 
   private void removeStoredBlock(DatanodeStorageInfo storageInfo, Block block,
@@ -4162,7 +4172,7 @@ public class BlockManager implements BlockStatsMXBean {
    */
   @VisibleForTesting
   public void addBlock(DatanodeStorageInfo storageInfo, Block block,
-      String delHint) throws IOException {
+      String delHint, long delGracePeriod) throws IOException {
     DatanodeDescriptor node = storageInfo.getDatanodeDescriptor();
     // Decrement number of blocks scheduled to this datanode.
     // for a retry request (of DatanodeProtocol#blockReceivedAndDeleted with 
@@ -4170,12 +4180,14 @@ public class BlockManager implements BlockStatsMXBean {
     node.decrementBlocksScheduled(storageInfo.getStorageType());
 
     // get the deletion hint node
-    DatanodeDescriptor delHintNode = null;
+    ReplicaDeleteHint delHintNode = null;
     if (delHint != null && delHint.length() != 0) {
-      delHintNode = datanodeManager.getDatanode(delHint);
-      if (delHintNode == null) {
+      DatanodeDescriptor datanode = datanodeManager.getDatanode(delHint);
+      if (datanode == null) {
         blockLog.warn("BLOCK* blockReceived: {} is expected to be removed " +
             "from an unrecorded node {}", block, delHint);
+      } else {
+        delHintNode = new ReplicaDeleteHint(datanode, delGracePeriod);
       }
     }
 
@@ -4201,7 +4213,7 @@ public class BlockManager implements BlockStatsMXBean {
    */
   private boolean processAndHandleReportedBlock(
       DatanodeStorageInfo storageInfo, Block block,
-      ReplicaState reportedState, DatanodeDescriptor delHintNode)
+      ReplicaState reportedState, ReplicaDeleteHint delHintNode)
       throws IOException {
 
     final DatanodeDescriptor node = storageInfo.getDatanodeDescriptor();
@@ -4223,7 +4235,7 @@ public class BlockManager implements BlockStatsMXBean {
       // the replica should be removed from the data-node.
       blockLog.debug("BLOCK* addBlock: block {} on node {} size {} does not " +
           "belong to any file", block, node, block.getNumBytes());
-      addToInvalidates(new Block(block), node);
+      addToInvalidates(new Block(block), node, 0);
       return true;
     }
 
@@ -4325,7 +4337,7 @@ public class BlockManager implements BlockStatsMXBean {
         deleted++;
         break;
       case RECEIVED_BLOCK:
-        addBlock(storageInfo, rdbi.getBlock(), rdbi.getDelHints());
+        addBlock(storageInfo, rdbi.getBlock(), rdbi.getDelHints(), blockReplaceGracePeriodInMs);
         received++;
         break;
       case RECEIVING_BLOCK:
