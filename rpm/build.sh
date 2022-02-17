@@ -13,6 +13,19 @@ fi
 
 RPM_DIR="$TEMP_OUTPUT_DIR"
 
+export JAVA_VERSION=adoptopenjdk11.0.9.1+1
+export JAVA_HOME="/usr/java/${JAVA_VERSION}"
+export PATH="${JAVA_HOME}/bin:${PATH}"
+
+yum install -y "$JAVA_VERSION"
+
+ln -fs ${JAVA_HOME}/bin/java /usr/bin/java11
+
+alternatives --install /usr/bin/java11 java11 ${JAVA_HOME}/bin/java 20000
+alternatives --install /usr/bin/javac11 javac11 ${JAVA_HOME}/bin/javac 20000
+alternatives --install /usr/bin/javadoc11 javadoc11 ${JAVA_HOME}/bin/javadoc 20000
+alternatives --install /usr/bin/jar11 jar11 ${JAVA_HOME}/bin/jar 20000
+
 # Setup scratch dir
 SCRATCH_DIR="${RPM_DIR}/scratch"
 
