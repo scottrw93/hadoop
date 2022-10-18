@@ -1,10 +1,7 @@
 buildType: MAVEN
 
 buildpack:
-  host: git.hubteam.com
-  organization: HubSpot
-  repository: rpm_builders
-  branch: master
+  name: Blazar-Buildpack-RPM
 
 provides:
   - name: hadoop-rpm
